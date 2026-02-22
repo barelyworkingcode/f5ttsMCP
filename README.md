@@ -42,6 +42,33 @@ outputs/          Generated audio (runtime, gitignored)
 cache/            Processed voice cache (runtime, gitignored)
 ```
 
+## Voices
+
+You must supply your own voice reference files in the `voices/` folder. Each voice needs a paired `.wav` and `.txt` file with the same name:
+
+```
+voices/bob.wav    # Reference audio clip
+voices/bob.txt    # Exact transcript of the audio clip
+```
+
+**Requirements:**
+- **24kHz sample rate** (mandatory -- the model will reject other rates)
+- WAV format, mono
+- 5-15 seconds of clean speech, minimal background noise
+- The `.txt` file must contain the exact words spoken in the `.wav` file
+
+A voice named `primary` is used as the default fallback when no voice is specified.
+
+Also create a `voices/voices.md` file -- the `list_voices` MCP tool returns its contents directly. Use a markdown table with columns for voice name, gender, and notes:
+
+```markdown
+| Voice Name | Gender | Notes           |
+|------------|--------|-----------------|
+| bob        | Male   | Narrator style  |
+| alice      | Female | British accent  |
+| primary    | Male   | Default voice   |
+```
+
 ## MCP Tools
 
 | Tool | Description |
