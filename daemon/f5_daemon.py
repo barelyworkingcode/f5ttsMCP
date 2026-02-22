@@ -6,12 +6,22 @@ Keeps F5-TTS model loaded in memory with Apple Silicon MLX acceleration
 import os
 import json
 import socket
+import struct
 import subprocess
 import threading
 import warnings
 import time
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import numpy as np
+import soundfile as sf
+import mlx.core as mx
+
+from f5_tts_mlx.generate import generate as f5_generate, SAMPLE_RATE
+from f5_tts_mlx.utils import convert_char_to_pinyin
+from f5_tts_mlx.cfm import F5TTS
 
 # Suppress warnings
 warnings.filterwarnings("ignore", message="In 2.9, this function's implementation will be changed")
@@ -36,11 +46,18 @@ class F5TTSDaemon:
         self.cfg_strength = cfg_strength  # Classifier-free guidance strength
         self.speed = speed  # Speed factor for duration estimation
 
-        # Voice audio processing cache
+        # Voice audio processing cache (stores batch-ready expanded tensors)
         self.audio_cache = {}
         self.cache_lock = threading.Lock()
         self.cache_dir = Path(__file__).parent.parent / "cache" / "voice_audio"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Pinyin conversion cache for ref_text (keyed by raw ref_text string)
+        self.pinyin_cache = {}
+        self.pinyin_cache_lock = threading.Lock()
+
+        # Thread pool for async file I/O
+        self.io_executor = ThreadPoolExecutor(max_workers=2)
 
     def get_voice_cache_key(self, voice_file):
         """Generate cache key for voice file based on file path and modification time"""
@@ -52,7 +69,10 @@ class F5TTSDaemon:
             return None
 
     def get_cached_audio(self, voice_file):
-        """Get cached processed audio for voice file if available"""
+        """Get cached processed audio for voice file if available.
+
+        Returns an already-expanded tensor (batch dim included) ready for f5tts.sample().
+        """
         cache_key = self.get_voice_cache_key(voice_file)
         if not cache_key:
             return None
@@ -62,16 +82,30 @@ class F5TTSDaemon:
             if cache_key in self.audio_cache:
                 return self.audio_cache[cache_key]
 
-            # Check disk cache
-            cache_file = self.cache_dir / f"{cache_key}.npz"
+            # Check disk cache (.npy format)
+            cache_file = self.cache_dir / f"{cache_key}.npy"
             if cache_file.exists():
                 try:
-                    import numpy as np
-                    data = np.load(cache_file)
-                    audio_array = data['audio']
-                    # Load into memory cache as MLX array
-                    import mlx.core as mx
+                    audio_array = np.load(cache_file)
                     mx_audio = mx.array(audio_array)
+                    self.audio_cache[cache_key] = mx_audio
+                    return mx_audio
+                except Exception:
+                    pass
+
+            # Legacy .npz fallback -- migrate on read
+            legacy_file = self.cache_dir / f"{cache_key}.npz"
+            if legacy_file.exists():
+                try:
+                    data = np.load(legacy_file)
+                    audio_array = data['audio']
+                    # Legacy cache stored raw audio; expand to batch dim
+                    if audio_array.ndim == 1:
+                        audio_array = np.expand_dims(audio_array, axis=0)
+                    mx_audio = mx.array(audio_array)
+                    # Re-save as .npy with expanded dims and remove legacy
+                    np.save(cache_file, audio_array)
+                    legacy_file.unlink(missing_ok=True)
                     self.audio_cache[cache_key] = mx_audio
                     return mx_audio
                 except Exception:
@@ -80,7 +114,7 @@ class F5TTSDaemon:
         return None
 
     def cache_audio(self, voice_file, processed_audio):
-        """Cache processed audio for voice file"""
+        """Cache processed audio for voice file (stores expanded tensor)"""
         cache_key = self.get_voice_cache_key(voice_file)
         if not cache_key or processed_audio is None:
             return
@@ -89,15 +123,26 @@ class F5TTSDaemon:
             # Store in memory cache
             self.audio_cache[cache_key] = processed_audio
 
-            # Store in disk cache
-            cache_file = self.cache_dir / f"{cache_key}.npz"
+            # Store in disk cache (uncompressed for faster writes)
+            cache_file = self.cache_dir / f"{cache_key}.npy"
             try:
-                import numpy as np
-                # Convert MLX array to numpy for storage
                 audio_np = np.array(processed_audio)
-                np.savez_compressed(cache_file, audio=audio_np)
+                np.save(cache_file, audio_np)
             except Exception as e:
                 print(f"Failed to cache processed audio: {e}")
+
+    def get_ref_text_pinyin(self, ref_text):
+        """Get pinyin-converted ref_text, using cache to avoid recomputation."""
+        with self.pinyin_cache_lock:
+            if ref_text in self.pinyin_cache:
+                return self.pinyin_cache[ref_text]
+
+        # Compute outside the lock (pure function, safe for concurrent calls)
+        pinyin = convert_char_to_pinyin([ref_text])[0]
+
+        with self.pinyin_cache_lock:
+            self.pinyin_cache[ref_text] = pinyin
+        return pinyin
 
     def update_activity(self):
         """Update last activity timestamp"""
@@ -128,9 +173,6 @@ class F5TTSDaemon:
     def load_model(self):
         """Load F5-TTS model once at startup"""
         try:
-            from f5_tts_mlx.generate import generate
-            from f5_tts_mlx.cfm import F5TTS
-
             if self.quantization_bits:
                 print(f"Loading F5-TTS model with {self.quantization_bits}-bit quantization...")
                 print(f"Expected memory savings: ~{40 if self.quantization_bits == 8 else 50}%")
@@ -138,7 +180,7 @@ class F5TTSDaemon:
                 print("Loading F5-TTS model (full precision)...")
 
             # Store both the generate function and the model instance with quantization
-            self.model = generate
+            self.model = f5_generate
             self.f5tts_instance = F5TTS.from_pretrained(
                 "lucasnewman/f5-tts-mlx",
                 quantization_bits=self.quantization_bits
@@ -157,10 +199,40 @@ class F5TTSDaemon:
             if self.method != "rk4":
                 print(f"Fast sampling: {self.method} method (vs default rk4) for speed optimization")
 
+            # Warmup: run a dummy generation to force MLX compilation
+            self._warmup_model()
+
             return True
         except Exception as e:
             print(f"Error loading F5-TTS: {e}")
             return False
+
+    def _warmup_model(self):
+        """Run a short dummy generation to trigger MLX lazy compilation."""
+        try:
+            print("Warming up model (first-run compilation)...")
+            warmup_start = time.time()
+
+            # Create a tiny synthetic reference audio (0.5s of silence at 24kHz)
+            dummy_audio = mx.zeros((1, SAMPLE_RATE // 2))
+            dummy_text = convert_char_to_pinyin(["warmup. hello"])
+
+            self.f5tts_instance.sample(
+                dummy_audio,
+                text=dummy_text,
+                duration=SAMPLE_RATE,  # Very short duration
+                steps=2,
+                method="euler",
+                speed=1.0,
+                cfg_strength=1.0,
+                sway_sampling_coef=-1.0,
+                seed=42,
+            )
+
+            warmup_time = time.time() - warmup_start
+            print(f"Model warmup complete ({warmup_time:.1f}s)")
+        except Exception as e:
+            print(f"Model warmup failed (non-fatal): {e}")
 
     def generate_speech(self, text, voice_file, output_file="outputs/daemon_output.wav", ref_text=None, save_ref_text=None):
         """Generate speech using the loaded model"""
@@ -199,21 +271,19 @@ class F5TTSDaemon:
                     # Use default
                     ref_text = "Hello, this is my voice speaking clearly and naturally. I am recording this sample for voice cloning purposes."
 
-            # Try to get cached processed audio first
+            # Try to get cached processed audio first (already expanded with batch dim)
             cache_start = time.time()
-            processed_audio = self.get_cached_audio(voice_file)
+            audio_expanded = self.get_cached_audio(voice_file)
             cache_time = time.time() - cache_start
 
-            if processed_audio is not None:
+            if audio_expanded is not None:
                 print(f"CACHE HIT: Loaded processed audio in {cache_time*1000:.2f}ms for: {os.path.basename(voice_file)}")
-                print(f"Audio shape: {processed_audio.shape}, skipping file I/O and processing")
+                print(f"Audio shape: {audio_expanded.shape}, skipping file I/O and processing")
             else:
                 print(f"CACHE MISS: No cached audio found for: {os.path.basename(voice_file)}")
                 # Load and process audio file
                 load_start = time.time()
                 print(f"Loading and processing audio file...")
-                import soundfile as sf
-                import mlx.core as mx
 
                 # Load reference audio
                 audio, sr = sf.read(voice_file)
@@ -221,24 +291,26 @@ class F5TTSDaemon:
                     raise ValueError(f"Reference audio must have a sample rate of 24kHz, got {sr}")
                 load_time = time.time() - load_start
 
-                # Convert to MLX array and normalize
+                # Convert to MLX array, normalize, and expand for batch dim
                 process_start = time.time()
                 audio = mx.array(audio)
                 TARGET_RMS = 0.1
                 rms = mx.sqrt(mx.mean(mx.square(audio)))
                 if rms < TARGET_RMS:
                     audio = audio * TARGET_RMS / rms
+                audio_expanded = mx.expand_dims(audio, axis=0)
                 process_time = time.time() - process_start
 
-                processed_audio = audio
-
-                # Cache the processed audio
+                # Cache the expanded audio tensor
                 cache_save_start = time.time()
-                self.cache_audio(voice_file, processed_audio)
+                self.cache_audio(voice_file, audio_expanded)
                 cache_save_time = time.time() - cache_save_start
 
                 total_processing = load_time + process_time + cache_save_time
                 print(f"CACHED: Load {load_time*1000:.1f}ms + Process {process_time*1000:.1f}ms + Save {cache_save_time*1000:.1f}ms = {total_processing*1000:.1f}ms total")
+
+            # Length of raw audio (without batch dim) for trimming generated output
+            ref_audio_len = audio_expanded.shape[1]
 
             transcribed_text = None
 
@@ -249,22 +321,16 @@ class F5TTSDaemon:
             # Generate speech using MLX with cached processed audio
             print("Using optimized generation with cached audio")
             try:
-                from f5_tts_mlx.generate import SAMPLE_RATE, HOP_LENGTH, FRAMES_PER_SEC, split_sentences
-                from f5_tts_mlx.utils import convert_char_to_pinyin
-                from f5_tts_mlx.cfm import F5TTS
-                import mlx.core as mx
-                import soundfile as sf
-                import numpy as np
-
-                # Use the loaded model instance from daemon
                 f5tts = self.f5tts_instance
 
-                # Process text
-                generation_text_processed = convert_char_to_pinyin([ref_text + " " + text])
+                # Use cached pinyin for ref_text, only convert generation text fresh
+                ref_pinyin = self.get_ref_text_pinyin(ref_text)
+                gen_pinyin = convert_char_to_pinyin([text])[0]
+                generation_text_processed = [ref_pinyin + " " + gen_pinyin]
 
-                # Generate using our cached processed audio with tunable parameters
+                # Generate using cached expanded audio tensor
                 wave, _ = f5tts.sample(
-                    mx.expand_dims(processed_audio, axis=0),
+                    audio_expanded,
                     text=generation_text_processed,
                     duration=None,  # Let it estimate
                     steps=self.steps,
@@ -276,11 +342,15 @@ class F5TTSDaemon:
                 )
 
                 # Trim the reference audio from the beginning
-                wave = wave[processed_audio.shape[0]:]
+                wave = wave[ref_audio_len:]
                 mx.eval(wave)
 
-                # Save the output
-                sf.write(output_file, np.array(wave), SAMPLE_RATE)
+                # Calculate duration directly from wave array
+                audio_duration = len(wave) / SAMPLE_RATE
+
+                # Write output file asynchronously
+                wave_np = np.array(wave)
+                write_future = self.io_executor.submit(sf.write, output_file, wave_np, SAMPLE_RATE)
 
             except Exception as e:
                 # Fallback to original method if custom generation fails
@@ -292,24 +362,37 @@ class F5TTSDaemon:
                     ref_audio_text=ref_text,
                     output_path=output_file
                 )
+                audio_duration = None
+                write_future = None
 
             generation_time = time.time() - start_time
 
-            if os.path.exists(output_file):
-                import soundfile as sf
+            # Ensure the file write completed before returning
+            if write_future is not None:
+                write_future.result()
+
+            if audio_duration is not None:
+                rtf = generation_time / audio_duration if audio_duration > 0 else 0
+                print(f"Generated: {audio_duration:.2f}s audio in {generation_time:.2f}s (RTF: {rtf:.2f}x)")
+                timing_info = {
+                    'audio_duration': audio_duration,
+                    'generation_time': generation_time,
+                    'server_rtf': rtf
+                }
+                return True, output_file, transcribed_text, timing_info
+            elif os.path.exists(output_file):
+                # Fallback path -- read duration from file
                 try:
                     info = sf.info(output_file)
                     rtf = generation_time / info.duration if info.duration > 0 else 0
                     print(f"Generated: {info.duration:.2f}s audio in {generation_time:.2f}s (RTF: {rtf:.2f}x)")
-
-                    # Return timing information for client
                     timing_info = {
                         'audio_duration': info.duration,
                         'generation_time': generation_time,
                         'server_rtf': rtf
                     }
                     return True, output_file, transcribed_text, timing_info
-                except:
+                except Exception:
                     print(f"Generated: {output_file} in {generation_time:.2f}s")
                     timing_info = {'generation_time': generation_time, 'server_rtf': None}
                     return True, output_file, transcribed_text, timing_info
@@ -360,43 +443,61 @@ class F5TTSDaemon:
             print(f"Error in batch processing: {e}")
             return [{'success': False, 'result': str(e), 'index': i} for i in range(len(batch_requests))]
 
-    def prewarm_voice_cache(self, voice_files):
-        """Pre-warm the voice cache for a list of voice files"""
-        unique_voices = set(voice_files)
-        print(f"Pre-warming cache for {len(unique_voices)} unique voice(s)...")
+    def prewarm_voice_cache(self, batch_requests):
+        """Pre-warm the audio and pinyin caches for a batch of requests.
 
-        import soundfile as sf
-        import mlx.core as mx
+        Args:
+            batch_requests: list of request dicts with 'voice_file' and optionally 'ref_text'.
 
-        for voice_file in unique_voices:
+        Returns:
+            dict mapping voice_file -> cached expanded audio tensor.
+        """
+        # Deduplicate by voice file
+        voice_to_ref = {}
+        for req in batch_requests:
+            vf = req.get('voice_file', '')
+            if vf and vf not in voice_to_ref:
+                voice_to_ref[vf] = req.get('ref_text')
+
+        print(f"Pre-warming cache for {len(voice_to_ref)} unique voice(s)...")
+
+        prewarmed = {}
+        for voice_file, ref_text in voice_to_ref.items():
             if not os.path.exists(voice_file):
                 print(f"Voice file not found: {voice_file}")
                 continue
 
             # Check if already cached
-            if self.get_cached_audio(voice_file) is not None:
+            cached = self.get_cached_audio(voice_file)
+            if cached is not None:
                 print(f"Already cached: {os.path.basename(voice_file)}")
-                continue
+                prewarmed[voice_file] = cached
+            else:
+                try:
+                    audio, sr = sf.read(voice_file)
+                    if sr != 24000:
+                        print(f"Voice {voice_file} has wrong sample rate: {sr}")
+                        continue
 
-            try:
-                # Load and process audio
-                audio, sr = sf.read(voice_file)
-                if sr != 24000:
-                    print(f"Voice {voice_file} has wrong sample rate: {sr}")
-                    continue
+                    audio = mx.array(audio)
+                    TARGET_RMS = 0.1
+                    rms = mx.sqrt(mx.mean(mx.square(audio)))
+                    if rms < TARGET_RMS:
+                        audio = audio * TARGET_RMS / rms
 
-                audio = mx.array(audio)
-                TARGET_RMS = 0.1
-                rms = mx.sqrt(mx.mean(mx.square(audio)))
-                if rms < TARGET_RMS:
-                    audio = audio * TARGET_RMS / rms
+                    audio_expanded = mx.expand_dims(audio, axis=0)
+                    self.cache_audio(voice_file, audio_expanded)
+                    prewarmed[voice_file] = audio_expanded
+                    print(f"Cached: {os.path.basename(voice_file)}")
+                except Exception as e:
+                    print(f"Failed to cache {voice_file}: {e}")
 
-                self.cache_audio(voice_file, audio)
-                print(f"Cached: {os.path.basename(voice_file)}")
-            except Exception as e:
-                print(f"Failed to cache {voice_file}: {e}")
+            # Pre-compute pinyin for ref_text if available
+            if ref_text:
+                self.get_ref_text_pinyin(ref_text)
 
         print(f"Voice cache pre-warming complete")
+        return prewarmed
 
     def generate_speech_batch_streaming(self, batch_requests, client_socket):
         """Generate speech for batch with streaming results - sends each result immediately"""
@@ -404,9 +505,8 @@ class F5TTSDaemon:
             total = len(batch_requests)
             print(f"Streaming batch of {total} requests...")
 
-            # Pre-warm voice cache for all voices in the batch
-            voice_files = [req.get('voice_file', '') for req in batch_requests]
-            self.prewarm_voice_cache(voice_files)
+            # Pre-warm voice and pinyin caches for all voices in the batch
+            self.prewarm_voice_cache(batch_requests)
 
             successful = 0
 
@@ -442,7 +542,7 @@ class F5TTSDaemon:
                 # Send this result immediately (newline-delimited JSON)
                 try:
                     response_line = json.dumps(chunk_result) + '\n'
-                    client_socket.send(response_line.encode('utf-8'))
+                    client_socket.sendall(response_line.encode('utf-8'))
                 except Exception as e:
                     print(f"Failed to send streaming result: {e}")
                     break
@@ -455,7 +555,7 @@ class F5TTSDaemon:
                 'successful_items': successful
             }
             try:
-                client_socket.send((json.dumps(completion) + '\n').encode('utf-8'))
+                client_socket.sendall((json.dumps(completion) + '\n').encode('utf-8'))
             except Exception as e:
                 print(f"Failed to send completion message: {e}")
 
@@ -469,9 +569,58 @@ class F5TTSDaemon:
                 'error': str(e)
             }
             try:
-                client_socket.send((json.dumps(error_msg) + '\n').encode('utf-8'))
+                client_socket.sendall((json.dumps(error_msg) + '\n').encode('utf-8'))
             except:
                 pass
+
+    def _recv_all(self, sock, length):
+        """Receive exactly `length` bytes from socket."""
+        chunks = []
+        received = 0
+        while received < length:
+            chunk = sock.recv(min(length - received, 65536))
+            if not chunk:
+                raise ConnectionError("Connection closed before all data received")
+            chunks.append(chunk)
+            received += len(chunk)
+        return b''.join(chunks)
+
+    def _recv_request(self, sock):
+        """Receive a length-prefixed JSON request.
+
+        Protocol: 4-byte big-endian length header followed by UTF-8 JSON payload.
+        Falls back to newline-delimited read for backwards compatibility.
+        """
+        # Peek at first 4 bytes to detect protocol
+        header = self._recv_all(sock, 4)
+
+        # Try interpreting as a length prefix
+        payload_len = struct.unpack('!I', header)[0]
+
+        # Sanity check: valid JSON starts with '{' (0x7b) or '[' (0x5b).
+        # A 4-byte length prefix for any reasonable payload will have a first
+        # byte that is NOT one of these ASCII characters (payloads < 8MB).
+        first_byte = header[0]
+        if first_byte in (0x7b, 0x5b):
+            # This looks like raw JSON (legacy client), not a length prefix.
+            # Read the rest using the old approach: accumulate until valid JSON.
+            data = header
+            while True:
+                try:
+                    return json.loads(data.decode('utf-8'))
+                except json.JSONDecodeError:
+                    pass
+                chunk = sock.recv(65536)
+                if not chunk:
+                    # No more data -- try one last parse
+                    return json.loads(data.decode('utf-8'))
+                data += chunk
+        else:
+            # Length-prefixed protocol
+            if payload_len > 100 * 1024 * 1024:  # 100MB sanity limit
+                raise ValueError(f"Payload length {payload_len} exceeds 100MB limit")
+            payload = self._recv_all(sock, payload_len)
+            return json.loads(payload.decode('utf-8'))
 
     def handle_client(self, client_socket, addr):
         """Handle individual client requests"""
@@ -481,20 +630,12 @@ class F5TTSDaemon:
             # Update activity timestamp
             self.update_activity()
 
-            # Receive request
-            data = client_socket.recv(4096).decode('utf-8')
-            print(f"Raw request data: {repr(data)}")
-
-            if not data:
-                print(f"No data received from {addr}")
-                return
-
+            # Receive request using length-prefixed protocol
             try:
-                request = json.loads(data)
+                request = self._recv_request(client_socket)
                 print(f"Parsed request: {json.dumps(request, indent=2)}")
-            except json.JSONDecodeError as e:
-                print(f"JSON decode error from {addr}: {e}")
-                print(f"Raw data was: {repr(data)}")
+            except (json.JSONDecodeError, ConnectionError, ValueError) as e:
+                print(f"Failed to receive request from {addr}: {e}")
                 return
 
             # Check if this is a batch request
@@ -517,7 +658,7 @@ class F5TTSDaemon:
                         'total_items': len(results),
                         'successful_items': sum(1 for r in results if r['success'])
                     }
-                    client_socket.send(json.dumps(response).encode('utf-8'))
+                    client_socket.sendall(json.dumps(response).encode('utf-8'))
                     return
 
             # Handle single request (existing logic)
@@ -548,7 +689,7 @@ class F5TTSDaemon:
                 'timing': timing_info if success else None
             }
 
-            client_socket.send(json.dumps(response).encode('utf-8'))
+            client_socket.sendall(json.dumps(response).encode('utf-8'))
 
         except Exception as e:
             print(f"Error handling client {addr}: {e}")
@@ -558,7 +699,7 @@ class F5TTSDaemon:
                 'output_file': None
             }
             try:
-                client_socket.send(json.dumps(error_response).encode('utf-8'))
+                client_socket.sendall(json.dumps(error_response).encode('utf-8'))
             except:
                 pass
         finally:

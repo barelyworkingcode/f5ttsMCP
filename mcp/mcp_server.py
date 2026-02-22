@@ -11,7 +11,10 @@ import os
 import re
 import shutil
 import socket
+import struct
+import queue
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
@@ -52,12 +55,13 @@ class DaemonClient:
         try:
             sock.connect((self.host, self.port))
 
-            # Send batch request with stream flag
+            # Send batch request with stream flag (length-prefixed protocol)
             request = {
                 'batch': batch_items,
                 'stream': True
             }
-            sock.send(json.dumps(request).encode('utf-8'))
+            payload = json.dumps(request).encode('utf-8')
+            sock.sendall(struct.pack('!I', len(payload)) + payload)
 
             # Read newline-delimited JSON responses
             buffer = ""
@@ -99,6 +103,10 @@ class DaemonClient:
             sock.close()
 
 class F5TTSServer:
+    _ABBREVIATIONS = re.compile(
+        r'^(?:Mr|Dr|Mrs|Ms|Prof|Sr|Jr|St|Inc|Corp|Ltd|vs|etc|[A-Z])$'
+    )
+
     def __init__(self):
         self.server = Server("f5-tts")
         self.base_path = Path(__file__).parent.parent
@@ -185,23 +193,62 @@ class F5TTSServer:
                 logger.error(f"Error calling tool {name}: {e}")
                 return [TextContent(type="text", text=f"Error: {str(e)}")]
 
+    def _split_sentences(self, text: str) -> List[str]:
+        """Split text into individual sentences, respecting common abbreviations."""
+        parts = re.split(r'(?<=[.!?])\s+(?=[A-Z"])', text)
+        merged = []
+        for part in parts:
+            # Merge back if previous part ended with an abbreviation
+            if merged:
+                prev = merged[-1]
+                # Get the last word before the period
+                last_word_match = re.search(r'(\S+)\.\s*$', prev)
+                if last_word_match:
+                    word = last_word_match.group(1).rstrip('.')
+                    if self._ABBREVIATIONS.match(word):
+                        merged[-1] = prev + ' ' + part
+                        continue
+            merged.append(part)
+        return merged
+
+    def _split_into_sentence_pairs(self, chunks: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Split chunks with >2 sentences into sentence-pair sub-chunks."""
+        result = []
+        for chunk in chunks:
+            sentences = self._split_sentences(chunk['text'])
+            if len(sentences) <= 2:
+                result.append(chunk)
+                continue
+            for i in range(0, len(sentences), 2):
+                pair = sentences[i:i + 2]
+                result.append({'voice': chunk['voice'], 'text': ' '.join(pair)})
+        return result
+
     def _parse_voice_chunks(self, text: str) -> List[Dict[str, str]]:
         """Parse text with [VOICE:name] directives into chunks for batch processing."""
-        # Pattern to match [VOICE:name] followed by text
-        pattern = r'\[VOICE:([^\]]+)\]\s*([^[]*?)(?=\[VOICE:|$)'
-        matches = re.findall(pattern, text)
+        directive_pattern = re.compile(r'\[VOICE:([^\]]+)\]')
+        chunks = []
+        last_voice = 'primary'
+        last_end = 0
 
-        if not matches:
-            # No voice directives found, use default voice
+        for match in directive_pattern.finditer(text):
+            # Capture any text before this directive
+            pre_text = text[last_end:match.start()].strip()
+            if pre_text:
+                chunks.append({'voice': last_voice, 'text': pre_text})
+
+            last_voice = match.group(1)
+            last_end = match.end()
+
+        # Capture trailing text after last directive (or entire text if no directives)
+        trailing = text[last_end:].strip()
+        if trailing:
+            chunks.append({'voice': last_voice, 'text': trailing})
+
+        if not chunks:
             return [{'voice': 'primary', 'text': text.strip()}]
 
-        chunks = []
-        for voice_name, voice_text in matches:
-            voice_text = voice_text.strip()
-            if voice_text:
-                chunks.append({'voice': voice_name, 'text': voice_text})
-
-        return chunks
+        return self._split_into_sentence_pairs(chunks)
 
     def _get_voice_file(self, voice_name: str) -> tuple[str, Optional[str]]:
         """Get voice file path and ref_text for a voice name."""
@@ -261,10 +308,78 @@ class F5TTSServer:
             logger.error(f"Error listing voices: {e}")
             return [TextContent(type="text", text=f"Error reading voices: {str(e)}")]
 
+    def _playback_worker(self, play_queue: queue.Queue, total: int) -> None:
+        """Drain the playback queue, playing files in order. Runs in its own thread."""
+        played = 0
+        while True:
+            item = play_queue.get()
+            if item is None:  # poison pill
+                break
+            played += 1
+            logger.info(f"Playing chunk {played}/{total}")
+            self._play_audio_file(item)
+        logger.info(f"Playback done: {played}/{total} chunks played")
+
+    def _run_generation(self, batch_items: List[Dict],
+                        play_immediately: bool) -> None:
+        """Run daemon batch generation and playback. Blocking -- meant for a background thread."""
+        start_time = time.time()
+        successful = 0
+        total = len(batch_items)
+        first_audio_time = None
+        total_audio_duration = 0.0
+
+        # Start playback thread if needed
+        play_queue: queue.Queue | None = None
+        playback_thread: threading.Thread | None = None
+        if play_immediately:
+            play_queue = queue.Queue()
+            playback_thread = threading.Thread(
+                target=self._playback_worker, args=(play_queue, total), daemon=True
+            )
+            playback_thread.start()
+
+        for result in self.daemon_client.send_streaming_batch(batch_items):
+            result_type = result.get('type')
+
+            if result_type == 'error':
+                logger.error(f"Daemon error: {result.get('error', 'Unknown')}")
+                break
+
+            elif result_type == 'chunk':
+                index = result.get('index', 0)
+                success = result.get('success', False)
+                output_file = result.get('output_file', '')
+                timing = result.get('timing', {})
+
+                if success:
+                    successful += 1
+                    if timing:
+                        total_audio_duration += timing.get('audio_duration', 0)
+
+                    if first_audio_time is None:
+                        first_audio_time = time.time() - start_time
+                        logger.info(f"Time to first audio: {first_audio_time:.2f}s")
+
+                    if play_queue and output_file:
+                        play_queue.put(output_file)
+                else:
+                    logger.warning(f"Chunk {index + 1} failed: {result.get('result', 'Unknown error')}")
+
+            elif result_type == 'complete':
+                logger.info(f"Batch complete: {result.get('successful_items')}/{result.get('total_items')}")
+
+        # Signal playback thread to finish and wait for it
+        if play_queue and playback_thread:
+            play_queue.put(None)
+            playback_thread.join()
+
+        total_time = time.time() - start_time
+        logger.info(f"Generation done: {successful}/{total} chunks, {total_time:.1f}s total, "
+                     f"{total_audio_duration:.1f}s audio")
+
     async def _generate_speech(self, text: str, play_immediately: bool = True) -> List[TextContent]:
         """Generate speech from text using direct daemon communication with streaming."""
-        start_time = time.time()
-
         # Check if daemon is running
         if not self.daemon_client.is_daemon_running():
             return [TextContent(
@@ -299,67 +414,25 @@ class F5TTSServer:
             if ref_text:
                 item['ref_text'] = ref_text
             else:
-                # Request transcription if no ref_text exists
                 text_file = self.voices_path / f"{chunk['voice']}.txt"
                 item['save_ref_text'] = str(text_file)
 
             batch_items.append(item)
 
-        # Send streaming batch request and process results
-        successful = 0
         total = len(batch_items)
-        first_audio_time = None
-        total_audio_duration = 0.0
-
         logger.info(f"Sending streaming batch of {total} items to daemon")
 
-        for result in self.daemon_client.send_streaming_batch(batch_items):
-            result_type = result.get('type')
+        # Run generation + playback in background thread to avoid MCP timeout
+        asyncio.get_event_loop().run_in_executor(
+            None, self._run_generation, batch_items, play_immediately
+        )
 
-            if result_type == 'error':
-                error_msg = result.get('error', 'Unknown daemon error')
-                logger.error(f"Daemon error: {error_msg}")
-                return [TextContent(type="text", text=f"Error: {error_msg}")]
-
-            elif result_type == 'chunk':
-                index = result.get('index', 0)
-                success = result.get('success', False)
-                output_file = result.get('output_file', '')
-                timing = result.get('timing', {})
-
-                if success:
-                    successful += 1
-                    if timing:
-                        total_audio_duration += timing.get('audio_duration', 0)
-
-                    # Record time to first audio
-                    if first_audio_time is None:
-                        first_audio_time = time.time() - start_time
-                        logger.info(f"Time to first audio: {first_audio_time:.2f}s")
-
-                    # Play audio immediately if requested
-                    if play_immediately and output_file:
-                        logger.info(f"Playing chunk {index + 1}/{total}")
-                        self._play_audio_file(output_file)
-                else:
-                    logger.warning(f"Chunk {index + 1} failed: {result.get('result', 'Unknown error')}")
-
-            elif result_type == 'complete':
-                logger.info(f"Batch complete: {result.get('successful_items')}/{result.get('total_items')}")
-
-        total_time = time.time() - start_time
-
-        # Build response summary
-        response_parts = ["Speech generation completed!"]
-        response_parts.append(f"Chunks: {successful}/{total} successful")
-        if first_audio_time is not None:
-            response_parts.append(f"Time to first audio: {first_audio_time:.1f}s")
-        response_parts.append(f"Total time: {total_time:.1f}s")
-        if total_audio_duration > 0:
-            response_parts.append(f"Audio duration: {total_audio_duration:.1f}s")
-        response_parts.append(f"Output: {chunk_dir}")
-
-        return [TextContent(type="text", text="\n".join(response_parts))]
+        voices_used = list(dict.fromkeys(c['voice'] for c in chunks))
+        return [TextContent(
+            type="text",
+            text=f"Generating {total} chunks (voices: {', '.join(voices_used)}). "
+                 f"Audio will play as each chunk completes.\nOutput: {chunk_dir}"
+        )]
 
     async def _replay_last_speech(self, delay_seconds: float = 0.25) -> List[TextContent]:
         """Replay the last generated speech chunks."""
