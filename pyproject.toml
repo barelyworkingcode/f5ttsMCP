@@ -1,0 +1,27 @@
+[project]
+name = "f5tts-mcp"
+version = "0.1.0"
+description = "F5-TTS MCP server with daemon architecture and MLX acceleration"
+license = {text = "MIT License"}
+requires-python = ">=3.11"
+dependencies = [
+    "f5-tts-mlx>=0.1.2",
+    "soundfile",
+    "mcp>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+]
+
+[project.scripts]
+f5tts-mcp = "mcp.mcp_server:main"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+ignore = ["E501"]  # Line too long (handled by formatter)
