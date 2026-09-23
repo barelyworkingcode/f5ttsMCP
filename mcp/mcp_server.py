@@ -128,7 +128,7 @@ class F5TTSServer:
             return [
                 Tool(
                     name="list_voices",
-                    description="Get list of available F5-TTS voices with gender information. Before calling this tool, acknowledge that you are retrieving the voice list.",
+                    description="Get the list of available F5-TTS voices with gender information, returned as the voices catalog in markdown. Use these names in generate_speech's [VOICE:voice_name] directives.",
                     inputSchema={
                         "type": "object",
                         "properties": {},
@@ -137,7 +137,7 @@ class F5TTSServer:
                 ),
                 Tool(
                     name="generate_speech",
-                    description="Generate speech from text using F5-TTS with voice assignments. Before calling this tool, confirm what text will be converted to speech and which voices will be used. Text should include [VOICE:voice_name] directives for multi-voice content.",
+                    description="Generate speech from text using F5-TTS with voice assignments, via the local F5-TTS daemon (fails immediately if it is not running). Returns as soon as the job is queued, with the chunk count, voices, and output directory; synthesis and playback continue in the background, so the result does not confirm the audio played. Text before the first [VOICE:voice_name] directive uses the 'primary' voice, and an unknown voice name silently falls back to 'primary'. Longer passages are split into two-sentence chunks. Each call replaces the previous generation's audio files.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -157,7 +157,7 @@ class F5TTSServer:
                 ),
                 Tool(
                     name="replay_last_speech",
-                    description="Replay the last generated speech audio chunks in sequence. Before calling this tool, confirm that you are replaying the most recent speech generation.",
+                    description="Replay the last generated speech audio chunks in sequence. Blocks until playback finishes (up to 2 minutes), then returns a short summary. Returns a message instead when no generation exists yet.",
                     inputSchema={
                         "type": "object",
                         "properties": {
