@@ -1,5 +1,9 @@
 # f5ttsMCP
 
+> **Retired / not deployed.** Not registered with relay. Port 9998 now belongs to relaySTT, and the
+> setup notes below are stale (the repo uses `pyproject.toml` + `uv.lock`, not conda; `voices/` is gone).
+> Kept for reference only — don't start this daemon.
+
 F5-TTS voice synthesis via MCP. Two-process architecture: a daemon (MLX model server on TCP 9998) and an MCP server that talks to it.
 
 ## Architecture
